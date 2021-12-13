@@ -44,14 +44,25 @@ flags.DEFINE_float('tau', 1.0, 'Tau parameter for logit adjustment.')
 flags.DEFINE_float('eg_lr', 0.1,
                    'Learning rate for exponentiated gradient update on class'
                    'weights.')
-flags.DEFINE_integer('update_freq', 32, 'Update class weights once in '
+flags.DEFINE_integer('update_freq', 128, 'Update class weights once in '
                      '"update_freq" number of gradient steps.')
 flags.DEFINE_string('tb_log_dir', 'non_decomp/log',
                     'Path to write Tensorboard summaries.')
 
 
 def main(_):
-
+  gpus = tf.config.list_physical_devices('GPU')
+  if gpus:
+    # Restrict TensorFlow to only allocate 1GB of memory on the first GPU
+    try:
+      tf.config.set_logical_device_configuration(
+          gpus[0],
+          [tf.config.LogicalDeviceConfiguration(memory_limit=8024)])
+      logical_gpus = tf.config.list_logical_devices('GPU')
+      print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+    except RuntimeError as e:
+      # Virtual devices must be set before GPUs have been initialized
+      print(e)
   # Prepare the datasets.
   dataset = utils.dataset_mappings()[FLAGS.dataset]
   num_classes = dataset.num_classes
@@ -96,6 +107,10 @@ def main(_):
   vali_recall_list = [tf.keras.metrics.Recall() for _ in range(num_classes)]
   vali_min_recall = utils.MinRecall(vali_recall_list)
   vali_mean_recall = utils.MeanRecall(vali_recall_list)
+
+  vali_precision_list = [tf.keras.metrics.Precision() for _ in range(num_classes)]
+  vali_min_precision = utils.MinRecall(vali_precision_list)
+  vali_mean_precision = utils.MeanRecall(vali_precision_list)
 
   test_recall_list = [tf.keras.metrics.Recall() for _ in range(num_classes)]
   test_min_recall = utils.MinRecall(test_recall_list)
@@ -164,19 +179,27 @@ def main(_):
           for ii in range(num_classes):
             vali_recall_list[ii].update_state(
                 labels_vec_val[:, ii], preds_vec_val[:, ii])
+            vali_precision_list[ii].update_state(
+                labels_vec_val[:, ii], preds_vec_val[:, ii])
 
         train_acc_metric.update_state(y, logits)
 
         # Log every 1000 batches.
-        if step % 10 == 0:
+        if step % 30 == 0:
           print(f'Training loss (for one batch) at step {epoch} / {step}: '
                 f'{loss_value:.4f}')
           vali_perf = vali_min_recall.result()
           vali_mean_perf = vali_mean_recall.result()
+          vali_min_prec = vali_min_precision.result()
+          vali_mean_prec = vali_mean_precision.result()
           print(f'Validation min recall (moving average) at step {epoch} / '
                 f'{step}: {vali_perf:.4f}')
           print(f'Validation mean recall (moving average) at step {epoch} / '
                 f'{step}: {vali_mean_perf:.4f}')
+          print(f'Validation min precision (moving average) at step {epoch} / '
+                f'{step}: {vali_min_prec:.4f}')
+          print(f'Validation mean precision (moving average) at step {epoch} / '
+                f'{step}: {vali_mean_prec:.4f}')
           if class_weights is not None:
             print(fnrs.result().numpy())
             print(class_weights.numpy())
@@ -186,7 +209,11 @@ def main(_):
             tf.summary.scalar(
                 'min recall', vali_perf, step=epoch * batches_per_epoch + step)
             tf.summary.scalar(
-                'min recall', vali_mean_perf, step=epoch * batches_per_epoch + step)
+                'mean recall', vali_mean_perf, step=epoch * batches_per_epoch + step)
+            tf.summary.scalar(
+                'min precision', vali_min_prec, step=epoch * batches_per_epoch + step)
+            tf.summary.scalar(
+                'mean precision', vali_mean_prec, step=epoch * batches_per_epoch + step)
 
     # Display train metrics at the end of each epoch.
     train_acc = train_acc_metric.result()
@@ -199,13 +226,25 @@ def main(_):
     # Display validation metrics at the end of each epoch.
     vali_perf = vali_min_recall.result()
     vali_mean_perf = vali_mean_recall.result()
+    vali_mean_prec = vali_mean_precision.result()
+    vali_min_prec = vali_min_precision.result()
+    
     for ii in range(num_classes):
       vali_recall_list[ii].reset_states()
+      vali_precision_list[ii].reset_states()
     print(f'Validation min recall over epoch: {vali_perf:.4f}')
     print(f'Validation mean recall over epoch: {vali_mean_perf:.4f}')
+    print(f'Validation min precision over epoch: {vali_min_prec:.4f}')
+    print(f'Validation mean precision over epoch: {vali_mean_prec:.4f}')
     with train_summary_writer.as_default():
       tf.summary.scalar(
           'vali min recall', vali_perf, step=(epoch + 1) * batches_per_epoch)
+      tf.summary.scalar(
+          'vali mean recall', vali_mean_perf, step=(epoch + 1) * batches_per_epoch)
+      tf.summary.scalar(
+          'vali min precision', vali_min_prec, step=(epoch + 1) * batches_per_epoch)
+      tf.summary.scalar(
+          'vali mean precision', vali_mean_prec, step=(epoch + 1) * batches_per_epoch)
 
     # Run a test loop at the end of each epoch.
     for x_test, y_test in test_dataset:
