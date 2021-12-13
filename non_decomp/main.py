@@ -95,6 +95,7 @@ def main(_):
 
   vali_recall_list = [tf.keras.metrics.Recall() for _ in range(num_classes)]
   vali_min_recall = utils.MinRecall(vali_recall_list)
+  vali_mean_recall = utils.MeanRecall(vali_recall_list)
 
   test_recall_list = [tf.keras.metrics.Recall() for _ in range(num_classes)]
   test_min_recall = utils.MinRecall(test_recall_list)
@@ -135,52 +136,57 @@ def main(_):
     # Iterate over the train dataset.
     for step, (x, y) in enumerate(train_dataset):
       labels_vec = tf.one_hot(y, depth=num_classes)
+      with tf.device("gpu"):
+        with tf.GradientTape() as tape:
+          logits = model(x, training=True)
+          loss_value = loss_fn(labels_vec, logits, class_weights)
+          loss_value = loss_value + tf.reduce_sum(model.losses)
 
-      with tf.GradientTape() as tape:
-        logits = model(x, training=True)
-        loss_value = loss_fn(labels_vec, logits, class_weights)
-        loss_value = loss_value + tf.reduce_sum(model.losses)
+        grads = tape.gradient(loss_value, model.trainable_weights)
+        optimizer.apply_gradients(zip(grads, model.trainable_weights))
 
-      grads = tape.gradient(loss_value, model.trainable_weights)
-      optimizer.apply_gradients(zip(grads, model.trainable_weights))
+        if step % FLAGS.update_freq == 0:
+          x_val, y_val = next(vali_iter)
+          labels_vec_val = tf.one_hot(y_val, depth=num_classes)
+          logits_val = model(x_val, training=False)
 
-      if step % FLAGS.update_freq == 0:
-        x_val, y_val = next(vali_iter)
-        labels_vec_val = tf.one_hot(y_val, depth=num_classes)
-        logits_val = model(x_val, training=False)
+          if FLAGS.mode == 'proposed':
+            # Exponentiated gradient update on class weights using vali batch.
+            fnrs.update_state(labels_vec_val, logits_val)
+            exp_class_weights = class_weights * tf.math.exp(
+                FLAGS.eg_lr * fnrs.result())
+            class_weights.assign(
+                exp_class_weights / tf.reduce_sum(exp_class_weights))
 
-        if FLAGS.mode == 'proposed':
-          # Exponentiated gradient update on class weights using vali batch.
-          fnrs.update_state(labels_vec_val, logits_val)
-          exp_class_weights = class_weights * tf.math.exp(
-              FLAGS.eg_lr * fnrs.result())
-          class_weights.assign(
-              exp_class_weights / tf.reduce_sum(exp_class_weights))
+          # Track per-class recall on vali data.
+          preds_vec_val = tf.one_hot(
+              tf.argmax(logits_val, axis=1), depth=num_classes)
+          for ii in range(num_classes):
+            vali_recall_list[ii].update_state(
+                labels_vec_val[:, ii], preds_vec_val[:, ii])
 
-        # Track per-class recall on vali data.
-        preds_vec_val = tf.one_hot(
-            tf.argmax(logits_val, axis=1), depth=num_classes)
-        for ii in range(num_classes):
-          vali_recall_list[ii].update_state(
-              labels_vec_val[:, ii], preds_vec_val[:, ii])
+        train_acc_metric.update_state(y, logits)
 
-      train_acc_metric.update_state(y, logits)
-
-      # Log every 1000 batches.
-      if step % 10 == 0:
-        print(f'Training loss (for one batch) at step {epoch} / {step}: '
-              f'{loss_value:.4f}')
-        vali_perf = vali_min_recall.result()
-        print(f'Validation min recall (moving average) at step {epoch} / '
-              f'{step}: {vali_perf:.4f}')
-        if class_weights is not None:
-          print(fnrs.result().numpy())
-          print(class_weights.numpy())
-        with train_summary_writer.as_default():
-          tf.summary.scalar(
-              'batch loss', loss_value, step=epoch * batches_per_epoch + step)
-          tf.summary.scalar(
-              'min recall', vali_perf, step=epoch * batches_per_epoch + step)
+        # Log every 1000 batches.
+        if step % 10 == 0:
+          print(f'Training loss (for one batch) at step {epoch} / {step}: '
+                f'{loss_value:.4f}')
+          vali_perf = vali_min_recall.result()
+          vali_mean_perf = vali_mean_recall.result()
+          print(f'Validation min recall (moving average) at step {epoch} / '
+                f'{step}: {vali_perf:.4f}')
+          print(f'Validation mean recall (moving average) at step {epoch} / '
+                f'{step}: {vali_mean_perf:.4f}')
+          if class_weights is not None:
+            print(fnrs.result().numpy())
+            print(class_weights.numpy())
+          with train_summary_writer.as_default():
+            tf.summary.scalar(
+                'batch loss', loss_value, step=epoch * batches_per_epoch + step)
+            tf.summary.scalar(
+                'min recall', vali_perf, step=epoch * batches_per_epoch + step)
+            tf.summary.scalar(
+                'min recall', vali_mean_perf, step=epoch * batches_per_epoch + step)
 
     # Display train metrics at the end of each epoch.
     train_acc = train_acc_metric.result()
@@ -192,9 +198,11 @@ def main(_):
 
     # Display validation metrics at the end of each epoch.
     vali_perf = vali_min_recall.result()
+    vali_mean_perf = vali_mean_recall.result()
     for ii in range(num_classes):
       vali_recall_list[ii].reset_states()
     print(f'Validation min recall over epoch: {vali_perf:.4f}')
+    print(f'Validation mean recall over epoch: {vali_mean_perf:.4f}')
     with train_summary_writer.as_default():
       tf.summary.scalar(
           'vali min recall', vali_perf, step=(epoch + 1) * batches_per_epoch)

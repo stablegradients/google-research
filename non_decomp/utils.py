@@ -160,6 +160,27 @@ class MinRecall(tf.keras.metrics.Metric):
     results = [m.result() for m in self.recall_list]
     return tf.reduce_min(results)
 
+class MeanRecall(tf.keras.metrics.Metric):
+  """Minimum of per-class recalls."""
+
+  def __init__(
+      self, recall_list=None, name='mean_recall', **kwargs):
+    super(MeanRecall, self).__init__(name=name, **kwargs)
+    self.recall_list = recall_list
+
+  def update_state(self, recall_list):
+    self.recall_list = list(recall_list)
+
+  def reset_state(self):
+    # No state to reset.
+    pass
+
+  def result(self):
+    if not self.recall_list:
+      raise ValueError('No Recall metrics specified.')
+    results = [m.result() for m in self.recall_list]
+    return tf.reduce_mean(results)
+
 
 class LearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
   """Step learning rate schedule."""
